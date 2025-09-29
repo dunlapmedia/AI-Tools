@@ -12,7 +12,8 @@ class AuDRACalendarAgent:
         self.SCOPES = ['https://www.googleapis.com/auth/calendar']
         self.CATEGORIES = [
             'Work', 'Free', 'Breakfast', 'Brunch', 'Lunch', 'Afternoon Tea', 'Dinner', 
-            'Workout', 'Laundry and Cleaning', 'Sleep', 'Writing', 'Bri', 'Health', 'SSS'
+            'Workout', 'Laundry and Cleaning', 'Sleep', 'Writing', 'Bri', 'Health', 'SSS',
+            'Travel'  # Added Travel category
         ]
         self.google_service = None
         self.apple_client = None
@@ -101,6 +102,12 @@ class AuDRACalendarAgent:
                 'daily': 1,     # 1 hour per day
                 'weekly': 7,    # 7 hours per week
                 'monthly': 28   # 28 hours per month
+            },
+            {
+                'category': 'Travel',
+                'daily': 0,     # No daily minimum
+                'weekly': 0,    # No weekly minimum
+                'monthly': 0    # No monthly minimum
             }
         ]
         self.CATEGORY_CONSTRAINTS = {
@@ -187,10 +194,16 @@ class AuDRACalendarAgent:
                 'preferred_end_time': '09:00',    # 9 AM
                 'consecutive_hours': True,         # Should be consecutive
                 'weekday_only': False,            # Applies all days
+            },
+            'Travel': {
+                'preferred_start_time': '00:00',  # Any time
+                'preferred_end_time': '23:59',    # Any time
+                'consecutive_hours': True,         # Should be consecutive
+                'weekday_only': False,            # Applies all days
             }
         }
-        self.ollama_url = "http://localhost:11434/api/generate"
-        self.ai_model = "mistral"  # Default model
+        self.ollama_url = "http://localhost:7869/api/generate"
+        self.ai_model = "llama3.2"  # Default model
 
     def authenticate_google(self, credentials_path):
         """Authenticate with Google Calendar API"""
@@ -289,6 +302,14 @@ def query_ollama(self, prompt):
         """Determine category for an event based on title and description"""
         title = event.get('summary', '').lower()
         description = event.get('description', '').lower()
+        location = event.get('location', '').lower()
+        
+        # Check for virtual work meetings
+        if ('virtual' in location or 'zoom' in location or 'teams' in location or 
+            'meet.google.com' in location):
+            if any(word in title or word in description for word in 
+                  ['meeting', 'conference', 'presentation', 'call']):
+                return 'Work'
         
         # Bri (highest priority)
         if any(word in title or word in description for word in 
@@ -349,6 +370,14 @@ def query_ollama(self, prompt):
                 'counseling', 'consultation', 'optometrist', 'specialist',
                 'physical therapy', 'vaccination', 'blood work']):
             return 'Health'
+        
+        # Travel category (add before Free time check)
+        if any(word in title or word in description for word in 
+               ['travel', 'flight', 'train', 'bus', 'drive', 'trip', 'journey',
+                'airport', 'station', 'departure', 'arrival', 'transit',
+                'commute', 'layover', 'connecting', 'vacation', 'hotel',
+                'booking', 'rental car', 'uber', 'lyft', 'taxi']):
+            return 'Travel'
         
         # Free time (including gaming and streaming activities)
         if any(word in title or word in description for word in 
@@ -481,15 +510,41 @@ def query_ollama(self, prompt):
         if not self.google_service:
             raise Exception("Google Calendar not authenticated")
 
+        # Get testcal ID
         calendar_list = self.google_service.calendarList().list().execute()
-        testcal_id = None
-        
-        for calendar in calendar_list['items']:
-            if calendar['summary'] == 'testcal':
-                testcal_id = calendar['id']
-                break
+        testcal_id = next((cal['id'] for cal in calendar_list['items'] 
+                          if cal['summary'] == 'testcal'), None)
 
         if testcal_id:
+            # Check if this is a work event and determine location
+            location = None
+            if category == 'Work':
+                # Check if it's Tuesday (1), Wednesday (2), or Thursday (3)
+                if start_time.weekday() in [1, 2, 3]:
+                    # Check for non-virtual, non-work events before 3 PM
+                    day_start = start_time.replace(hour=0, minute=0, second=0)
+                    cutoff_time = start_time.replace(hour=15, minute=0, second=0)
+                    
+                    events_result = self.google_service.events().list(
+                        calendarId=testcal_id,
+                        timeMin=day_start.isoformat() + 'Z',
+                        timeMax=cutoff_time.isoformat() + 'Z',
+                        singleEvents=True
+                    ).execute()
+
+                    has_in_person_event = False
+                    for event in events_result.get('items', []):
+                        event_category = next((cat for cat in self.CATEGORIES 
+                                            if f"[Category:{cat}]" in event.get('description', '')), None)
+                        if (event_category != 'Work' and 
+                            event.get('location') and 
+                            'virtual' not in event.get('location', '').lower()):
+                            has_in_person_event = True
+                            break
+
+                    if not has_in_person_event:
+                        location = "141 W Jackson Blvd, Chicago, IL"
+
             event = {
                 'summary': title,
                 'description': f"{description}\n[Category:{category}]" if category else description,
@@ -502,6 +557,10 @@ def query_ollama(self, prompt):
                     'timeZone': 'UTC',
                 },
             }
+
+            # Add location if set
+            if location:
+                event['location'] = location
 
             return self.google_service.events().insert(
                 calendarId=testcal_id,
